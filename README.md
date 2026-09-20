@@ -1,6 +1,6 @@
 # 裁纸排版 API（Guillotine Cutting Plan API）
 
-面向小型印刷店的裁纸排版服务：输入原纸尺寸、切缝宽度和成品清单，按**可旋转的铡刀式切割**规则（每一刀都贯穿当前子矩形）生成多张原纸的排版方案。每张原纸返回成品坐标、旋转标记、利用率、刀数（`cut_count`），以及与坐标完全一致的二叉切割树；切缝计入每一次分割，成品互不重叠、不越界。可选地通过 `max_cuts_per_sheet` 限制每张原纸的刀数。
+面向小型印刷店的裁纸排版服务：输入原纸尺寸、切缝宽度和成品清单，按**可旋转的铡刀式切割**规则（每一刀都贯穿当前子矩形）生成多张原纸的排版方案。每张原纸返回成品坐标、旋转标记、利用率、刀数（`cut_count`），以及与坐标完全一致的二叉切割树；切缝计入每一次分割，成品互不重叠、不越界。可选地通过 `max_cuts_per_sheet` 限制每张原纸的刀数，或通过 `gripper_zone` 预留机台叼口（该边整条区域不得放置成品，以一道切缝为 `kerf` 的分割刀切下并记为 waste）。
 
 ## 一键启动
 
@@ -39,7 +39,8 @@ docker compose up --build
   ],
   "locked_placements": [
     { "item": "flyer", "x": 0, "y": 0, "rotated": false }
-  ]
+  ],
+  "gripper_zone": { "edge": "bottom", "size": 15 }
 }
 ```
 
@@ -55,10 +56,33 @@ docker compose up --build
 | `locked_placements[].item` | string | 必须出现在 `items[].id` 中 | 被锁定成品标识 |
 | `locked_placements[].x` / `y` | number | `>= 0` | 左上角坐标，旋转后的占位不得越出原纸 |
 | `locked_placements[].rotated` | boolean | 可省略，默认 `false` | 是否旋转 90° |
+| `gripper_zone` | object | 可选，缺省无保留区 | 机台叼口保留区：该边整条区域不得放置成品 |
+| `gripper_zone.edge` | string | `top` / `right` / `bottom` / `left` | 叼口所在原纸边 |
+| `gripper_zone.size` | number | `> 0` | 保留区宽度（垂直于该边的尺寸） |
 
 **锁定数量计入需求**：每种成品的锁定件数从其 `quantity` 中扣除，超出 `quantity` 返回 422；锁定项之间不得重叠。锁定布局还必须在给定 `kerf` 下能递归分解为铡刀切割树（每件之间留得出贯穿全矩形的切缝），否则返回 422 并在 `detail` 中指出冲突项的序号（从 1 开始）与 `item` id。验证通过后，引擎只在切割树的**可用余料叶**中放置剩余数量，放不下再开新原纸；锁定成品的坐标永不移动。
 
 **刀数上限（`max_cuts_per_sheet`）**：刀数按每张原纸 `cut_tree` 中的 `cut` 节点计数，第一张原纸上锁定布局产生的刀数同样计入——锁定树自身超限即返回 422。排版选位时只采用预计切分后不超上限的余料，适配程度（短边适配、面积适配）相同时优先新增刀数更少的候选；已开原纸均不可用时新开原纸。若某成品单件在空白原纸上（两种朝向取最少）也无法在上限内形成合法切割树，整个请求返回 422。
+
+**叼口保留区（`gripper_zone`）**：设置后，每张原纸靠近指定边（`top`/`right`/`bottom`/`left`）整条宽 `size` 的区域为机台叼口，**不得放置任何成品**。引擎在排版前先用一道贯穿全纸的分割刀把保留区切下：
+
+- 保留区在 `cut_tree` 中为一块与该边等长的 `waste` 叶（例如 `edge: "bottom"` 时位于 `y = 原纸高 - size`）；
+- 分割刀与普通刀一样消耗 `kerf`，成品只能排在剩余的内缩区域之内（内缩区起点 = `size + kerf`）；
+- 该刀计入每张原纸的 `cut_count`，同样受 `max_cuts_per_sheet` 约束（上限不足连保留区都无法切下时返回 422）；
+- 扣除保留区与切缝后剩余区域宽或高不为正，或某成品两种朝向都放不进剩余区域时，返回 422；
+- `locked_placements` 进入保留区、或跨在分割切缝（`kerf` 刀缝）上时，返回 422，`detail` 指出该锁定项的序号（从 1 开始）与 `item` id；
+- 不设置该字段时排版结果与之前完全一致。
+
+最小示例：900×600 原纸、`kerf: 3`、底边预留 15mm 叼口，则成品只能落在 `y + height ≤ 582` 的区域内，每张原纸的树根把 `0 ~ 582` 的可排版区与 `585 ~ 600` 的叼口废料用一道水平刀分开。
+
+```json
+{
+  "stock": { "width": 900, "height": 600 },
+  "kerf": 3,
+  "items": [{ "id": "flyer", "width": 210, "height": 148, "quantity": 6 }],
+  "gripper_zone": { "edge": "bottom", "size": 15 }
+}
+```
 
 **响应（200）**
 
@@ -109,7 +133,7 @@ docker compose up --build
   - `direction: "horizontal"`：水平一刀，`children[0]` 为上侧、`children[1]` 为下侧；
   - 第二个子节点的起点 = 第一个子节点的终点 + `kerf`（切缝被这刀消耗）。
 - `item`（叶子）：一件成品，坐标与 `placements` 中的条目一一对应。
-- `waste`（叶子）：剩余边角料（可回收利用的余料）。
+- `waste`（叶子）：剩余边角料（可回收利用的余料）；设置 `gripper_zone` 时，与叼口边等长、整块被切下的叼口保留区也是一片 `waste` 叶（树根分割刀的子节点）。
 
 切割顺序即自根向下的前序遍历。若余料宽度不足一个切缝（刀片会把它完全吃掉），则作为修边损耗，不再产生节点。
 
@@ -126,6 +150,10 @@ docker compose up --build
 | `422` | 锁定成品越界、彼此重叠：`locked placements #1 item 'A' and #2 item 'B' overlap` |
 | `422` | 锁定布局无法在给定 `kerf` 下分解为铡刀切割树（不存在贯穿整个子矩形、且留出 `kerf` 切缝的分割刀），`detail` 指出冲突项，例如：<br>`locked placements cannot be produced by guillotine cuts with kerf 3: no full-span cut ... separates the conflicting placements (#2 item 'A', #3 item 'B'); adjust their coordinates or the kerf` |
 | `422` | 锁定布局的切割树刀数超过 `max_cuts_per_sheet`：<br>`locked placements need 3 cuts on the first sheet, exceeding max_cuts_per_sheet 2` |
+| `422` | `gripper_zone` 扣除保留区与切缝后没有可排版区域（宽或高不为正）：<br>`gripper_zone of size 99.0 on the 'top' edge leaves no usable area on stock 100.0 x 100.0 after the kerf (2.0)` |
+| `422` | 成品能放进原纸、但放不进叼口保留区之外的剩余区域：<br>`item 'poster' (95.0 x 95.0) does not fit in the 100.0 x 88.0 area left by the gripper_zone (edge 'top', size 10.0, kerf 2.0) on stock 100.0 x 100.0` |
+| `422` | 锁定成品进入叼口保留区或跨过分隔切缝，`detail` 指出序号与 item：<br>`locked placement #2 item 'A' enters the gripper keep-out zone of the gripper_zone (edge 'top', size 10.0, kerf 2.0)`<br>`locked placement #2 item 'A' straddles the separator cut (kerf strip) of the gripper_zone ...` |
+| `422` | 叼口分割刀与排版刀数之和超过 `max_cuts_per_sheet`，例如单件最少需要 3 刀（含分隔刀）却设上限 2：<br>`item 'A' (40.0 x 40.0) needs at least 3 cuts on a fresh sheet 100.0 x 100.0, exceeding max_cuts_per_sheet 2` |
 
 ## 本地开发
 
@@ -144,3 +172,4 @@ uvicorn app.main:app --reload
 - 锁定布局分解成功后，其树中的空余叶（响应里的 `waste`）作为余料参与后续最佳适配放置；若某余料放入成品后剩下的窄边不足一个切缝（无法形成合法刀线），则跳过该余料、改放其他余料或新开原纸。
 - 设置 `max_cuts_per_sheet` 后，每张原纸的刀数（`cut` 节点数）不超过该值：第一张原纸先计入锁定树的刀数；选位时跳过切分会超限的余料，适配得分相同时优先新增刀数更少的候选；已开原纸都不可用时新开原纸；单件在空白原纸上所需的最少刀数（两种朝向取小）超限则在排版前直接判定 422。
 - 测试（`tests/check_plan.py`）对每份方案递归校验：每刀贯穿子矩形、切缝恰好等于 `kerf`、成品不重叠、不越界、树叶与坐标列表一致、利用率吻合、`cut_count` 与切割树的 `cut` 节点数一致、锁定件均在第一张原纸。
+- 设置 `gripper_zone` 时，每张原纸（含锁定件所在的第一张）的树根先以一道贯穿全纸的分割刀分出叼口 `waste` 叶（该刀计入 `cut_count` 与 `max_cuts_per_sheet`、消耗一个 `kerf`），随后全部排版只在剩余内缩区域内进行；锁定件进入保留区或压在分隔切缝上即在排版前以 422 拒绝。

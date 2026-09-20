@@ -32,6 +32,16 @@ class Item(BaseModel):
     quantity: int = Field(ge=1, le=MAX_QUANTITY, description="需求数量")
 
 
+class GripperZone(BaseModel):
+    edge: Literal["top", "right", "bottom", "left"] = Field(
+        description="叼口所在原纸边：top 上边、right 右边、bottom 下边、left 左边"
+    )
+    size: float = Field(
+        gt=0, le=MAX_DIMENSION,
+        description="叼口保留区宽度（垂直于该边的尺寸），整条边区域均不得放置成品",
+    )
+
+
 class LockedPlacement(BaseModel):
     item: str = Field(min_length=1, max_length=64,
                       description="预先定位成品的标识，须出现在 items 中")
@@ -60,6 +70,13 @@ class PlanRequest(BaseModel):
             "预先定位、必须原样保留的成品（均位于第一张原纸）。"
             "锁定数量计入对应 item 的需求数量；布局必须能在给定 kerf 下"
             "递归分解为铡刀切割树。"
+        ),
+    )
+    gripper_zone: Optional[GripperZone] = Field(
+        default=None,
+        description=(
+            "机台叼口保留区：该边整条区域必须先用一道切缝为 kerf 的分割刀"
+            "从原纸切出并记为 waste，其内不得放置任何成品；缺省时无保留区。"
         ),
     )
 

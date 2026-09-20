@@ -4,7 +4,13 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .models import PlanRequest, PlanResponse
-from .packer import CutLimitError, LockedLayoutError, UnfitItemError, build_plan
+from .packer import (
+    CutLimitError,
+    GripperZoneError,
+    LockedLayoutError,
+    UnfitItemError,
+    build_plan,
+)
 
 app = FastAPI(
     title="Guillotine Cutting Plan API",
@@ -75,6 +81,10 @@ def create_plan(request: PlanRequest) -> dict:
         locked.append((item_id, placement.x, placement.y,
                        placement.rotated, ref))
 
+    gripper = None
+    if request.gripper_zone is not None:
+        gripper = (request.gripper_zone.edge, request.gripper_zone.size)
+
     try:
         return build_plan(
             stock_width=request.stock.width,
@@ -83,6 +93,8 @@ def create_plan(request: PlanRequest) -> dict:
             items=items,
             locked=locked,
             max_cuts_per_sheet=request.max_cuts_per_sheet,
+            gripper=gripper,
         )
-    except (UnfitItemError, LockedLayoutError, CutLimitError) as exc:
+    except (UnfitItemError, LockedLayoutError, CutLimitError,
+            GripperZoneError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

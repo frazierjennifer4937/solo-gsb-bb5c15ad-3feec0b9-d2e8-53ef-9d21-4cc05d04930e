@@ -2,6 +2,7 @@ import pytest
 
 from app.packer import (
     CutLimitError,
+    GripperZoneError,
     LockedLayoutError,
     Node,
     Piece,
@@ -10,7 +11,7 @@ from app.packer import (
     _best_fit,
     build_plan,
 )
-from tests.check_plan import check_plan, count_cut_nodes, iter_leaves
+from tests.check_plan import EPS, check_plan, count_cut_nodes, iter_leaves
 
 
 def plan(stock_w, stock_h, kerf, items):
@@ -400,3 +401,165 @@ class TestBestFitCutLimit:
         piece = Piece("A", 20, 10)
         assert _best_fit([sheet], piece, max_cuts=1) is None
         assert _best_fit([sheet], piece, max_cuts=2) is not None
+
+
+# ---------------------------------------------------------------------------
+# gripper zone (机台叼口保留区)
+# ---------------------------------------------------------------------------
+
+GRIPPER_CASES = {
+    # edge: (separator direction, waste strip rect, exact-fill piece size)
+    "top": ("horizontal", (0.0, 0.0, 100.0, 10.0), (100.0, 88.0)),
+    "bottom": ("horizontal", (0.0, 90.0, 100.0, 10.0), (100.0, 88.0)),
+    "left": ("vertical", (0.0, 0.0, 10.0, 100.0), (88.0, 100.0)),
+    "right": ("vertical", (90.0, 0.0, 10.0, 100.0), (88.0, 100.0)),
+}
+
+
+class TestGripperZone:
+    @pytest.mark.parametrize("edge", ["top", "right", "bottom", "left"])
+    def test_strip_cut_off_as_waste_on_every_sheet(self, edge):
+        direction, waste_rect, _ = GRIPPER_CASES[edge]
+        result = build_plan(100, 100, 2, [("A", 40, 40, 6)],
+                            gripper=(edge, 10))
+        check_plan(result)
+        for sheet in result["sheets"]:
+            root = sheet["cut_tree"]
+            assert root["type"] == "cut"
+            assert root["direction"] == direction
+            leaves = list(iter_leaves(root))
+            strips = [l for l in leaves
+                      if (l["type"], l["x"], l["y"],
+                          l["width"], l["height"]) == ("waste",) + waste_rect]
+            assert len(strips) == 1
+
+    @pytest.mark.parametrize("edge", ["top", "right", "bottom", "left"])
+    def test_no_piece_enters_the_zone(self, edge):
+        result = build_plan(100, 100, 2, [("A", 40, 40, 8)],
+                            gripper=(edge, 10))
+        check_plan(result)
+        for sheet in result["sheets"]:
+            for p in sheet["placements"]:
+                if edge == "top":
+                    assert p["y"] >= 12 - EPS
+                elif edge == "bottom":
+                    assert p["y"] + p["height"] <= 88 + EPS
+                elif edge == "left":
+                    assert p["x"] >= 12 - EPS
+                else:
+                    assert p["x"] + p["width"] <= 88 + EPS
+
+    @pytest.mark.parametrize("edge", ["top", "right", "bottom", "left"])
+    def test_separator_cut_is_counted(self, edge):
+        # A single piece fills the inner rectangle exactly: the only cut
+        # is the gripper separator.
+        direction, waste_rect, (pw, ph) = GRIPPER_CASES[edge]
+        result = build_plan(100, 100, 2, [("A", pw, ph, 1)],
+                            gripper=(edge, 10))
+        check_plan(result)
+        sheet = result["sheets"][0]
+        assert sheet["cut_count"] == 1
+        leaves = list(iter_leaves(sheet["cut_tree"]))
+        assert len(leaves) == 2
+        assert {l["type"] for l in leaves} == {"item", "waste"}
+
+    def test_kerf_zero_separator_is_knife_edge(self):
+        result = build_plan(100, 100, 0, [("A", 100, 90, 1)],
+                            gripper=("top", 10))
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 1
+        p = result["sheets"][0]["placements"][0]
+        assert (p["y"], p["height"]) == (10, 90)
+
+    def test_strip_reduces_capacity(self):
+        # Inner height is 88 after the strip and kerf: eight 10-high rows
+        # still fit per sheet either way, but each additional overflow
+        # sheet loses the same capacity too, so filling exactly 16 rows
+        # needs 2 sheets without a zone and 3 with it.
+        without = build_plan(100, 100, 2, [("A", 100, 10, 16)])
+        with_zone = build_plan(100, 100, 2, [("A", 100, 10, 16)],
+                               gripper=("top", 10))
+        check_plan(with_zone)
+        assert without["summary"]["sheet_count"] == 2
+        assert with_zone["summary"]["sheet_count"] == 3
+
+    def test_no_gripper_keeps_legacy_plan(self):
+        args = (100, 100, 3, [("A", 30, 30, 3), ("B", 25, 20, 5)])
+        assert build_plan(*args) == build_plan(*args, gripper=None)
+
+    def test_inner_area_without_positive_size_rejected(self):
+        with pytest.raises(GripperZoneError):
+            build_plan(100, 100, 2, [("A", 10, 10, 1)],
+                       gripper=("top", 100))
+
+    def test_item_fitting_stock_but_not_inner_rejected(self):
+        with pytest.raises(GripperZoneError) as exc:
+            build_plan(100, 100, 2, [("A", 95, 95, 1)],
+                       gripper=("top", 10))
+        assert "A" in str(exc.value)
+        assert "gripper_zone" in str(exc.value)
+
+    def test_separator_cut_counts_towards_limit(self):
+        # 40x40 inside 100x88 with kerf 2 costs two more cuts after the
+        # separator: total 3.
+        with pytest.raises(CutLimitError):
+            build_plan(100, 100, 2, [("A", 40, 40, 1)],
+                       gripper=("top", 10), max_cuts_per_sheet=2)
+        result = build_plan(100, 100, 2, [("A", 40, 40, 1)],
+                            gripper=("top", 10), max_cuts_per_sheet=3)
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 3
+
+    def test_locked_piece_inside_inner_area_accepted(self):
+        result = build_plan(
+            100, 100, 2, [("A", 40, 40, 2)],
+            locked=[("A", 12, 12, False, 1)], gripper=("top", 10))
+        check_plan(result)
+        assert result["sheets"][0]["placements"][0]["locked"] is True
+
+    def test_locked_piece_entering_zone_rejected(self):
+        with pytest.raises(GripperZoneError) as exc:
+            build_plan(100, 100, 2, [("A", 40, 40, 1)],
+                       locked=[("A", 0, 5, False, 1)],
+                       gripper=("top", 10))
+        message = str(exc.value)
+        assert "#1" in message and "A" in message
+
+    def test_locked_piece_straddling_separator_rejected(self):
+        # Piece starts at y=11 inside the kerf strip [10, 12).
+        with pytest.raises(GripperZoneError):
+            build_plan(100, 100, 2, [("A", 40, 40, 1)],
+                       locked=[("A", 0, 11, False, 1)],
+                       gripper=("top", 10))
+
+    @pytest.mark.parametrize("edge,locked_xy", [
+        ("right", (49, 0)),    # ends at 89, inside kerf [88, 90)
+        ("bottom", (0, 49)),
+        ("left", (11, 0)),
+    ])
+    def test_locked_straddle_rejected_other_edges(self, edge, locked_xy):
+        x, y = locked_xy
+        with pytest.raises(GripperZoneError):
+            build_plan(100, 100, 2, [("A", 40, 40, 1)],
+                       locked=[("A", x, y, False, 1)],
+                       gripper=(edge, 10))
+
+    def test_locked_tree_plus_separator_counts_towards_limit(self):
+        pinned = [("A", 0, 15, False, 1), ("A", 50, 15, False, 2)]
+        with pytest.raises(CutLimitError):
+            build_plan(100, 100, 5, [("A", 45, 40, 2)],
+                       locked=pinned, gripper=("top", 10),
+                       max_cuts_per_sheet=3)
+        result = build_plan(100, 100, 5, [("A", 45, 40, 2)],
+                            locked=pinned, gripper=("top", 10),
+                            max_cuts_per_sheet=4)
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 4
+
+    def test_error_names_ref_and_item(self):
+        with pytest.raises(GripperZoneError) as exc:
+            build_plan(100, 100, 2, [("box", 40, 40, 1)],
+                       locked=[("box", 5, 0, False, 3)],
+                       gripper=("left", 10))
+        message = str(exc.value)
+        assert "#3" in message and "box" in message

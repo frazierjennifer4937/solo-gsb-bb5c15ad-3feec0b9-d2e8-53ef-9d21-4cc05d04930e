@@ -34,6 +34,17 @@ rejected when its tree alone exceeds it.  While packing, a free rectangle
 is only used when the split it takes keeps its sheet within the cap, and
 equal fits prefer the split adding fewer cuts.  A piece that cannot be
 cut from a blank sheet within the cap is rejected up front.
+
+Gripper zone
+------------
+A request may reserve a full-span strip along one stock edge (the
+press gripper / 叼口).  The strip is cut off every sheet with one
+kerf-consuming guillotine cut and becomes a permanent ``waste`` leaf;
+that separator cut counts towards ``cut_count`` and
+``max_cuts_per_sheet``.  All packing happens in the remaining inner
+rectangle.  When the inner rectangle is unusable (a non-positive
+dimension), or a pinned piece enters the strip or straddles the
+separator cut, GripperZoneError is raised.
 """
 from __future__ import annotations
 
@@ -71,6 +82,10 @@ class LockedLayoutError(ValueError):
 
 class CutLimitError(ValueError):
     """Raised when the per-sheet cut limit cannot be honoured."""
+
+
+class GripperZoneError(ValueError):
+    """Raised when the gripper (叼口) keep-out strip cannot be honoured."""
 
 
 @dataclass
@@ -187,6 +202,131 @@ def _corner_fill_ok(pw: float, ph: float, width: float, height: float,
     ok_r = slack_r <= EPS or slack_r >= kerf - EPS
     ok_b = slack_b <= EPS or slack_b >= kerf - EPS
     return ok_r and ok_b
+
+
+# ---------------------------------------------------------------------------
+# gripper zone (机台叼口保留区)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GripperZone:
+    """A full-span keep-out strip along one stock edge.
+
+    ``inner`` is the rectangle still available for packing; ``waste`` is
+    the strip that must be cut off (both in stock coordinates, origin at
+    the top-left).  ``cut_direction`` is the direction of the separator
+    cut: horizontal for top/bottom strips, vertical for left/right.
+    """
+
+    edge: str
+    size: float
+    inner: Node
+    waste: Node
+    cut_direction: str
+    inner_first: bool  # separator cut child order: True puts inner first
+
+
+def _make_gripper(edge: str, size: float, stock_width: float,
+                  stock_height: float, kerf: float) -> GripperZone:
+    """Build the geometry of a gripper strip, validating the inner area."""
+    size = float(size)
+    if edge == "top":
+        inner_w, inner_h = stock_width, stock_height - size - kerf
+        inner = Node("free", 0.0, size + kerf, inner_w, inner_h)
+        waste = Node("waste", 0.0, 0.0, stock_width, size)
+        direction = "horizontal"  # waste strip is the top (first) child
+        inner_first = False
+    elif edge == "bottom":
+        inner_w, inner_h = stock_width, stock_height - size - kerf
+        inner = Node("free", 0.0, 0.0, inner_w, inner_h)
+        waste = Node("waste", 0.0, stock_height - size, stock_width, size)
+        direction = "horizontal"  # inner area is the top (first) child
+        inner_first = True
+    elif edge == "left":
+        inner_w, inner_h = stock_width - size - kerf, stock_height
+        inner = Node("free", size + kerf, 0.0, inner_w, inner_h)
+        waste = Node("waste", 0.0, 0.0, size, stock_height)
+        direction = "vertical"  # waste strip is the left (first) child
+        inner_first = False
+    else:  # right
+        inner_w, inner_h = stock_width - size - kerf, stock_height
+        inner = Node("free", 0.0, 0.0, inner_w, inner_h)
+        waste = Node("waste", stock_width - size, 0.0, size, stock_height)
+        direction = "vertical"  # inner area is the left (first) child
+        inner_first = True
+
+    if inner.width <= EPS or inner.height <= EPS:
+        raise GripperZoneError(
+            f"gripper_zone of size {_num(size)} on the '{edge}' edge leaves "
+            f"no usable area on stock {_num(stock_width)} x "
+            f"{_num(stock_height)} after the kerf ({kerf})"
+        )
+
+    return GripperZone(edge=edge, size=size, inner=inner, waste=waste,
+                       cut_direction=direction, inner_first=inner_first)
+
+
+def _wrap_sheet_gripper(sheet: Sheet, zone: GripperZone) -> None:
+    """Turn a fresh sheet whose root is the inner rectangle into a sheet
+    whose root separates the permanent gripper waste strip from the
+    packable inner rectangle with one kerf-consuming cut."""
+    inner = sheet.root
+    children = ([inner, zone.waste] if zone.inner_first
+                else [zone.waste, inner])
+    root = Node("cut", 0.0, 0.0, sheet.width, sheet.height,
+                direction=zone.cut_direction, children=children)
+    sheet.root = root
+    sheet.cuts += 1
+
+
+def _check_locked_gripper(lp: LockedPiece, zone: GripperZone,
+                          kerf: float) -> None:
+    """Reject pinned pieces entering the gripper strip or crossing its cut.
+
+    The separator kerf strip lies between the inner area and the gripper
+    strip; a piece touching the strip intrudes into the blade path, while
+    a piece reaching into the strip lands inside the keep-out zone.
+    """
+    edge = zone.edge
+    ref_label = f"#{lp.ref} item '{lp.piece.item_id}'"
+    if edge == "top":
+        boundary = lp.y
+        if boundary < zone.size - EPS:
+            reason = "enters the gripper keep-out zone"
+        elif boundary < zone.size + kerf - EPS:
+            reason = "straddles the separator cut (kerf strip)"
+        else:
+            return
+    elif edge == "bottom":
+        edge_y = lp.y + lp.height
+        strip_y = zone.waste.y
+        if edge_y > strip_y + EPS:
+            reason = "enters the gripper keep-out zone"
+        elif edge_y > strip_y - kerf + EPS:
+            reason = "straddles the separator cut (kerf strip)"
+        else:
+            return
+    elif edge == "left":
+        boundary = lp.x
+        if boundary < zone.size - EPS:
+            reason = "enters the gripper keep-out zone"
+        elif boundary < zone.size + kerf - EPS:
+            reason = "straddles the separator cut (kerf strip)"
+        else:
+            return
+    else:  # right
+        edge_x = lp.x + lp.width
+        strip_x = zone.waste.x
+        if edge_x > strip_x + EPS:
+            reason = "enters the gripper keep-out zone"
+        elif edge_x > strip_x - kerf + EPS:
+            reason = "straddles the separator cut (kerf strip)"
+        else:
+            return
+    raise GripperZoneError(
+        f"locked placement {ref_label} {reason} of the gripper_zone "
+        f"(edge '{edge}', size {_num(zone.size)}, kerf {kerf})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +820,8 @@ def _node_dict(node: Node) -> dict:
 def build_plan(stock_width: float, stock_height: float, kerf: float,
                items: list[tuple[str, float, float, int]],
                locked: list[tuple[str, float, float, bool, int]] | None = None,
-               max_cuts_per_sheet: int | None = None
+               max_cuts_per_sheet: int | None = None,
+               gripper: tuple[str, float] | None = None
                ) -> dict:
     """Pack ``items`` (id, width, height, quantity) onto stock sheets.
 
@@ -688,22 +829,44 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     (item_id, x, y, rotated, request_index).  Locked pieces count towards
     their item's quantity.  ``max_cuts_per_sheet`` caps the number of cuts
     (cut nodes) in any sheet's tree; the locked layout on the first sheet
-    counts towards the cap.  Returns a dict matching the PlanResponse
-    schema.  Raises UnfitItemError if any item cannot fit on a fresh
-    sheet, CutLimitError if the cut cap cannot be honoured, or
-    LockedLayoutError if the pinned layout is invalid.
+    counts towards the cap.  ``gripper`` optionally reserves a full-span
+    strip (edge, size) on every sheet: the strip is cut off as permanent
+    waste with one kerf-consuming cut before any packing.  Returns a dict
+    matching the PlanResponse schema.  Raises UnfitItemError if any item
+    cannot fit on a fresh sheet, CutLimitError if the cut cap cannot be
+    honoured, LockedLayoutError if the pinned layout is invalid, or
+    GripperZoneError if the gripper strip cannot be honoured.
     """
+    zone: GripperZone | None = None
+    if gripper is not None:
+        zone = _make_gripper(gripper[0], gripper[1], stock_width,
+                             stock_height, kerf)
+        avail_w, avail_h = zone.inner.width, zone.inner.height
+    else:
+        avail_w, avail_h = stock_width, stock_height
+
     catalog: dict[str, Piece] = {}
     for item_id, width, height, quantity in items:
-        if not (_fits(width, height, stock_width, stock_height)
-                or _fits(height, width, stock_width, stock_height)):
+        piece = Piece(item_id, width, height)
+        orientations = [(pw, ph) for pw, ph in _orientations(piece)
+                        if _fits(pw, ph, avail_w, avail_h)]
+        if not orientations:
+            if zone is not None and (
+                    _fits(width, height, stock_width, stock_height)
+                    or _fits(height, width, stock_width, stock_height)):
+                raise GripperZoneError(
+                    f"item '{item_id}' ({width} x {height}) does not fit in "
+                    f"the {_num(avail_w)} x {_num(avail_h)} area left by the "
+                    f"gripper_zone (edge '{zone.edge}', size {_num(zone.size)}"
+                    f", kerf {kerf}) on stock {stock_width} x {stock_height}"
+                )
             raise UnfitItemError(item_id, width, height, stock_width, stock_height)
         if max_cuts_per_sheet is not None:
-            piece = Piece(item_id, width, height)
-            min_cuts = min(
-                _split_cuts(pw, ph, stock_width, stock_height, kerf)
-                for pw, ph in _orientations(piece)
-                if _fits(pw, ph, stock_width, stock_height)
+            # One extra cut on every sheet separates the gripper strip.
+            base_cuts = 1 if zone is not None else 0
+            min_cuts = base_cuts + min(
+                _split_cuts(pw, ph, avail_w, avail_h, kerf)
+                for pw, ph in orientations
             )
             if min_cuts > max_cuts_per_sheet:
                 raise CutLimitError(
@@ -712,7 +875,7 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
                     f"{stock_height}, exceeding max_cuts_per_sheet "
                     f"{max_cuts_per_sheet}"
                 )
-        catalog[item_id] = Piece(item_id, width, height)
+        catalog[item_id] = piece
 
     locked_pieces: list[LockedPiece] = []
     for item_id, x, y, rotated, ref in locked or []:
@@ -728,10 +891,13 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
                 f"{_num(y)}) ({_num(pw)} x {_num(ph)}) is outside the stock "
                 f"{stock_width} x {stock_height}"
             )
-        locked_pieces.append(LockedPiece(
+        lp = LockedPiece(
             piece=piece, x=x, y=y, width=pw, height=ph,
             rotated=bool(rotated), ref=ref,
-        ))
+        )
+        if zone is not None:
+            _check_locked_gripper(lp, zone, kerf)
+        locked_pieces.append(lp)
 
     # Pairwise overlaps are rejected explicitly with both references named.
     for i in range(len(locked_pieces)):
@@ -758,14 +924,27 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     total_pieces = len(locked_pieces) + len(remaining)
 
     if locked_pieces:
-        root = Node(kind="free", x=0.0, y=0.0,
-                    width=stock_width, height=stock_height)
-        sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
-                      root=root)
-        sheets.append(sheet)
-        free_rects = _decompose_locked(
-            root, locked_pieces, kerf, [LOCKED_SEARCH_BUDGET])
-        sheet.cuts = _count_cuts(root)
+        if zone is not None:
+            # Start inside the area left by the gripper strip; the locked
+            # decomposition fills that inner root, which is then wrapped
+            # with the permanent separator cut.
+            root = Node(kind="free", x=zone.inner.x, y=zone.inner.y,
+                        width=zone.inner.width, height=zone.inner.height)
+            sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
+                          root=root)
+            sheets.append(sheet)
+            free_rects = _decompose_locked(
+                root, locked_pieces, kerf, [LOCKED_SEARCH_BUDGET])
+            _wrap_sheet_gripper(sheet, zone)
+        else:
+            root = Node(kind="free", x=0.0, y=0.0,
+                        width=stock_width, height=stock_height)
+            sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
+                          root=root)
+            sheets.append(sheet)
+            free_rects = _decompose_locked(
+                root, locked_pieces, kerf, [LOCKED_SEARCH_BUDGET])
+        sheet.cuts = _count_cuts(sheet.root)
         if max_cuts_per_sheet is not None and sheet.cuts > max_cuts_per_sheet:
             raise CutLimitError(
                 f"locked placements need {sheet.cuts} cuts on the first "
@@ -789,9 +968,23 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     remaining.sort(key=lambda p: (max(p.width, p.height), p.width * p.height),
                    reverse=True)
 
-    for piece in remaining:
-        found = _best_fit(sheets, piece, max_cuts_per_sheet)
-        if found is None:
+    def _new_sheet(piece: Piece) -> None:
+        """Open a fresh sheet (with its gripper strip pre-cut when set) and
+        place ``piece`` first."""
+        if zone is not None:
+            root = Node(kind="free", x=zone.inner.x, y=zone.inner.y,
+                        width=zone.inner.width, height=zone.inner.height)
+            sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
+                          root=root, free=[root])
+            _wrap_sheet_gripper(sheet, zone)
+            # The separator cut already spent one unit of the budget.
+            inner_limit = (max_cuts_per_sheet - 1
+                           if max_cuts_per_sheet is not None else None)
+            pw, ph = _fresh_orientation(piece, avail_w, avail_h, kerf,
+                                        inner_limit)
+            sheets.append(sheet)
+            _place(sheet, 0, piece, pw, ph)
+        else:
             root = Node(kind="free", x=0.0, y=0.0,
                         width=stock_width, height=stock_height)
             sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
@@ -800,6 +993,11 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
             pw, ph = _fresh_orientation(piece, stock_width, stock_height,
                                         kerf, max_cuts_per_sheet)
             _place(sheet, 0, piece, pw, ph)
+
+    for piece in remaining:
+        found = _best_fit(sheets, piece, max_cuts_per_sheet)
+        if found is None:
+            _new_sheet(piece)
         else:
             si, fi, pw, ph = found
             _place(sheets[si], fi, piece, pw, ph)
