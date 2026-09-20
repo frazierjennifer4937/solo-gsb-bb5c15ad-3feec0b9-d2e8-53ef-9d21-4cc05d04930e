@@ -41,6 +41,13 @@ class LockedPlacement(BaseModel):
     rotated: bool = Field(default=False, description="是否旋转了 90 度")
 
 
+class GripperZone(BaseModel):
+    edge: Literal["top", "right", "bottom", "left"] = Field(
+        description="叼口所在边：该边整条保留区不得放置成品")
+    size: float = Field(gt=0, le=MAX_DIMENSION,
+                        description="保留区宽度（自该边向内的距离）")
+
+
 class PlanRequest(BaseModel):
     stock: Stock = Field(description="原纸尺寸")
     kerf: float = Field(default=0.0, ge=0.0, le=MAX_KERF,
@@ -50,6 +57,14 @@ class PlanRequest(BaseModel):
         description=(
             "每张原纸允许的最大刀数（按 cut_tree 中 cut 节点计数），"
             "缺省表示不限制"
+        ),
+    )
+    gripper_zone: Optional[GripperZone] = Field(
+        default=None,
+        description=(
+            "机台叼口保留区：原纸某一边整条 size 宽的区域不得放置成品；"
+            "每张原纸先以一刀贯穿整纸的分隔刀切出该区域并记为 waste，"
+            "该刀消耗 kerf 且计入 cut_count 与 max_cuts_per_sheet"
         ),
     )
     items: list[Item] = Field(min_length=1, max_length=MAX_ITEM_TYPES,

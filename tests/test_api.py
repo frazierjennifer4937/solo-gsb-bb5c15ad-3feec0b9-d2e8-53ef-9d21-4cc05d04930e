@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from tests.check_plan import check_plan
+from tests.check_plan import check_plan, iter_leaves
 
 client = TestClient(app)
 
@@ -338,3 +338,217 @@ def test_cut_count_returned_per_sheet():
     body = response.json()
     check_plan(body)  # check_plan asserts cut_count matches the cut tree
     assert all("cut_count" in s for s in body["sheets"])
+
+
+# ---------------------------------------------------------------------------
+# gripper_zone
+# ---------------------------------------------------------------------------
+
+GRIPPER_PAYLOAD = {
+    "stock": {"width": 100, "height": 100},
+    "kerf": 3,
+    "items": [{"id": "A", "width": 40, "height": 30, "quantity": 2}],
+    "gripper_zone": {"edge": "top", "size": 10},
+}
+
+
+def test_gripper_zone_reserved_as_waste():
+    response = client.post("/plans", json=GRIPPER_PAYLOAD)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    for sheet in body["sheets"]:
+        root = sheet["cut_tree"]
+        assert root["type"] == "cut" and root["direction"] == "horizontal"
+        zone, usable = root["children"]
+        assert zone["type"] == "waste"
+        assert (zone["x"], zone["y"], zone["width"], zone["height"]) == \
+            (0.0, 0.0, 100.0, 10.0)
+        assert usable["y"] == 13.0  # size 10 + kerf 3
+        for p in sheet["placements"]:
+            assert p["y"] >= 13.0
+
+
+def test_gripper_zone_each_edge():
+    expected = {
+        "top": ("horizontal", (0.0, 0.0, 100.0, 10.0),
+                lambda p: p["y"] >= 13.0),
+        "bottom": ("horizontal", (0.0, 90.0, 100.0, 10.0),
+                   lambda p: p["y"] + p["height"] <= 87.0),
+        "left": ("vertical", (0.0, 0.0, 10.0, 100.0),
+                 lambda p: p["x"] >= 13.0),
+        "right": ("vertical", (90.0, 0.0, 10.0, 100.0),
+                  lambda p: p["x"] + p["width"] <= 87.0),
+    }
+    for edge, (direction, zone_rect, clear) in expected.items():
+        payload = {
+            "stock": {"width": 100, "height": 100},
+            "kerf": 3,
+            "items": [{"id": "A", "width": 40, "height": 30, "quantity": 3}],
+            "gripper_zone": {"edge": edge, "size": 10},
+        }
+        response = client.post("/plans", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        check_plan(body)
+        for sheet in body["sheets"]:
+            root = sheet["cut_tree"]
+            assert root["type"] == "cut"
+            assert root["direction"] == direction
+            leaves = list(iter_leaves(root))
+            assert any(
+                leaf["type"] == "waste"
+                and (leaf["x"], leaf["y"], leaf["width"], leaf["height"])
+                == zone_rect
+                for leaf in leaves
+            )
+            for p in sheet["placements"]:
+                assert clear(p)
+
+
+def test_gripper_zone_separating_cut_counted():
+    # One piece exactly filling the 100x87 usable region: only the
+    # gripper cut remains.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 100, "height": 87, "quantity": 1}],
+        "gripper_zone": {"edge": "top", "size": 10},
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    sheet = body["sheets"][0]
+    assert sheet["cut_count"] == 1
+    assert sheet["placements"][0]["y"] == 13.0
+
+
+def test_gripper_zone_counts_towards_max_cuts():
+    # A 40x40 piece needs two cuts in the usable region; the gripper cut
+    # makes three, exceeding the limit of two.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1}],
+        "max_cuts_per_sheet": 2,
+        "gripper_zone": {"edge": "top", "size": 10},
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    assert "max_cuts_per_sheet" in response.json()["detail"]
+
+    payload["max_cuts_per_sheet"] = 3
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    assert body["sheets"][0]["cut_count"] == 3
+
+
+def test_gripper_zone_leaving_no_usable_area_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 10, "height": 10, "quantity": 1}],
+        "gripper_zone": {"edge": "top", "size": 98},  # 98 + kerf 3 > 100
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    assert "gripper zone" in response.json()["detail"]
+
+
+def test_gripper_zone_item_no_longer_fits_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "poster", "width": 100, "height": 95, "quantity": 1}],
+        "gripper_zone": {"edge": "top", "size": 10},
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "poster" in detail and "usable area" in detail
+
+
+def test_gripper_zone_validation_rejected():
+    base = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"width": 10, "height": 10, "quantity": 1}],
+    }
+    for bad in ({"edge": "top", "size": 0},
+                {"edge": "top", "size": -5},
+                {"edge": "middle", "size": 10},
+                {"edge": "top"},
+                {"size": 10},
+                "top"):
+        payload = {**base, "gripper_zone": bad}
+        assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_gripper_zone_locked_inside_zone_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1}],
+        "gripper_zone": {"edge": "top", "size": 10},
+        "locked_placements": [{"item": "A", "x": 20, "y": 0}],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "#1" in detail and "'A'" in detail
+    assert "gripper zone" in detail
+
+
+def test_gripper_zone_locked_crossing_cut_rejected():
+    # y=11 sits in the kerf strip [10, 13) consumed by the separating cut.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1}],
+        "gripper_zone": {"edge": "top", "size": 10},
+        "locked_placements": [{"item": "A", "x": 20, "y": 11}],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "#1" in detail and "'A'" in detail
+    assert "crosses" in detail
+
+
+def test_gripper_zone_locked_happy_path():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 2}],
+        "gripper_zone": {"edge": "left", "size": 10},
+        "locked_placements": [{"item": "A", "x": 13, "y": 0}],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    locked = [p for p in body["sheets"][0]["placements"] if p["locked"]]
+    assert len(locked) == 1
+    assert locked[0]["x"] == 13.0
+
+
+def test_plan_without_gripper_zone_unchanged():
+    # Omitting the field keeps the legacy layout: pieces may be placed
+    # anywhere on the sheet, including the strip a gripper zone would
+    # reserve.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 3,
+        "items": [{"id": "A", "width": 100, "height": 95, "quantity": 1}],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    assert body["sheets"][0]["placements"][0]["y"] == 0.0
+    # The same request with a top gripper zone of 10 must fail: the
+    # piece no longer fits the remaining usable region.
+    payload["gripper_zone"] = {"edge": "top", "size": 10}
+    assert client.post("/plans", json=payload).status_code == 422

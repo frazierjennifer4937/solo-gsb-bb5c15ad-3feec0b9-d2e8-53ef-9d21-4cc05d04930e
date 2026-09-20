@@ -2,6 +2,7 @@ import pytest
 
 from app.packer import (
     CutLimitError,
+    GripperZoneError,
     LockedLayoutError,
     Node,
     Piece,
@@ -366,6 +367,166 @@ class TestCutLimit:
         assert result["summary"]["sheet_count"] == 2
         assert result["sheets"][0]["cut_count"] == 3
         assert result["sheets"][1]["cut_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# gripper zone
+# ---------------------------------------------------------------------------
+
+class TestGripperZone:
+    def test_zone_cut_out_as_waste(self):
+        result = build_plan(100, 100, 3, [("A", 40, 30, 2)],
+                            gripper_zone=("top", 10))
+        check_plan(result)
+        root = result["sheets"][0]["cut_tree"]
+        assert root["type"] == "cut" and root["direction"] == "horizontal"
+        zone, usable = root["children"]
+        assert zone["type"] == "waste"
+        assert (zone["x"], zone["y"], zone["width"], zone["height"]) == \
+            (0, 0, 100, 10)
+        # The usable region starts one kerf below the reserved strip.
+        assert usable["y"] == 13
+        assert usable["height"] == 87
+        for p in result["sheets"][0]["placements"]:
+            assert p["y"] >= 13
+
+    def test_zone_rect_for_each_edge(self):
+        expected = {
+            # edge: (direction, zone rect, placement-clear predicate)
+            "top": ("horizontal", (0, 0, 100, 10),
+                    lambda p: p["y"] >= 13),
+            "bottom": ("horizontal", (0, 90, 100, 10),
+                       lambda p: p["y"] + p["height"] <= 87),
+            "left": ("vertical", (0, 0, 10, 100),
+                     lambda p: p["x"] >= 13),
+            "right": ("vertical", (90, 0, 10, 100),
+                      lambda p: p["x"] + p["width"] <= 87),
+        }
+        for edge, (direction, zone_rect, clear) in expected.items():
+            result = build_plan(100, 100, 3, [("A", 40, 30, 3)],
+                                gripper_zone=(edge, 10))
+            check_plan(result)
+            for sheet in result["sheets"]:
+                root = sheet["cut_tree"]
+                assert root["type"] == "cut"
+                assert root["direction"] == direction
+                first, second = root["children"]
+                zone = first if edge in ("top", "left") else second
+                assert zone["type"] == "waste"
+                assert (zone["x"], zone["y"],
+                        zone["width"], zone["height"]) == zone_rect
+                for p in sheet["placements"]:
+                    assert clear(p)
+
+    def test_every_sheet_carries_the_zone(self):
+        # Usable width is 87: the 90x80 pieces only fit rotated, one per
+        # sheet, so every sheet must repeat the gripper cut.
+        result = build_plan(100, 100, 3, [("A", 90, 80, 3)],
+                            gripper_zone=("right", 10))
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 3
+        for sheet in result["sheets"]:
+            root = sheet["cut_tree"]
+            assert root["type"] == "cut" and root["direction"] == "vertical"
+            zone = root["children"][1]
+            assert zone["type"] == "waste"
+            assert (zone["x"], zone["width"]) == (90, 10)
+            assert sheet["cut_count"] == count_cut_nodes(root)
+
+    def test_separating_cut_consumes_kerf_and_counts(self):
+        # Usable height is 100 - 10 - 3 = 87; one exact-fit piece needs
+        # only the gripper cut.
+        result = build_plan(100, 100, 3, [("A", 100, 87, 1)],
+                            gripper_zone=("bottom", 10))
+        check_plan(result)
+        sheet = result["sheets"][0]
+        assert sheet["cut_count"] == 1
+        usable, zone = sheet["cut_tree"]["children"]
+        assert zone["y"] == 90  # usable 87 + kerf 3
+        assert sheet["placements"][0]["height"] == 87
+
+    def test_zero_kerf_zone_touches_usable_region(self):
+        result = build_plan(100, 100, 0, [("A", 100, 90, 1)],
+                            gripper_zone=("top", 10))
+        check_plan(result)
+        sheet = result["sheets"][0]
+        assert sheet["cut_count"] == 1
+        assert sheet["placements"][0]["y"] == 10
+
+    def test_no_usable_area_raises(self):
+        with pytest.raises(GripperZoneError) as excinfo:
+            build_plan(100, 100, 3, [("A", 10, 10, 1)],
+                       gripper_zone=("top", 98))
+        assert "gripper zone" in str(excinfo.value)
+
+    def test_item_not_fitting_usable_area_raises(self):
+        # 100x95 fits the sheet but not the 100x87 usable region.
+        with pytest.raises(GripperZoneError) as excinfo:
+            build_plan(100, 100, 3, [("poster", 100, 95, 1)],
+                       gripper_zone=("top", 10))
+        assert "poster" in str(excinfo.value)
+
+    def test_locked_inside_zone_rejected(self):
+        with pytest.raises(LockedLayoutError) as excinfo:
+            build_plan(100, 100, 3, [("A", 40, 40, 1)],
+                       locked=[("A", 20, 0, False, 1)],
+                       gripper_zone=("top", 10))
+        message = str(excinfo.value)
+        assert "#1" in message and "'A'" in message
+        assert "enters the gripper zone" in message
+
+    def test_locked_crossing_separating_cut_rejected(self):
+        # y=11 lies in the kerf strip [10, 13): past the zone itself but
+        # across the separating cut.
+        with pytest.raises(LockedLayoutError) as excinfo:
+            build_plan(100, 100, 3, [("A", 40, 40, 1)],
+                       locked=[("A", 20, 11, False, 1)],
+                       gripper_zone=("top", 10))
+        message = str(excinfo.value)
+        assert "#1" in message and "'A'" in message
+        assert "crosses the gripper zone cut" in message
+
+    def test_locked_within_usable_region_accepted(self):
+        result = build_plan(100, 100, 3, [("A", 40, 40, 2)],
+                            locked=[("A", 0, 13, False, 1)],
+                            gripper_zone=("top", 10))
+        check_plan(result)
+        locked = [p for p in result["sheets"][0]["placements"] if p["locked"]]
+        assert len(locked) == 1
+        assert locked[0]["y"] == 13
+
+    def test_locked_tree_cut_count_includes_gripper_cut(self):
+        # The locked pair needs three cuts inside the usable region; the
+        # gripper cut brings the sheet to four.
+        result = build_plan(
+            100, 100, 5, [("A", 45, 40, 2)],
+            locked=[("A", 0, 15, False, 1), ("A", 50, 15, False, 2)],
+            gripper_zone=("top", 10))
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 4
+
+    def test_gripper_cut_counts_towards_max_cuts(self):
+        # A 40x40 piece needs two cuts in the 100x87 usable region; with
+        # the gripper cut that is three.
+        with pytest.raises(CutLimitError) as excinfo:
+            build_plan(100, 100, 3, [("A", 40, 40, 1)],
+                       max_cuts_per_sheet=2, gripper_zone=("top", 10))
+        assert "max_cuts_per_sheet" in str(excinfo.value)
+        result = build_plan(100, 100, 3, [("A", 40, 40, 1)],
+                            max_cuts_per_sheet=3, gripper_zone=("top", 10))
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 3
+
+    def test_locked_tree_plus_gripper_cut_over_limit_rejected(self):
+        with pytest.raises(CutLimitError):
+            build_plan(
+                100, 100, 5, [("A", 45, 40, 2)],
+                locked=[("A", 0, 15, False, 1), ("A", 50, 15, False, 2)],
+                max_cuts_per_sheet=3, gripper_zone=("top", 10))
+
+    def test_unset_zone_keeps_legacy_layout(self):
+        assert build_plan(100, 100, 3, [("A", 40, 30, 3)]) == \
+            build_plan(100, 100, 3, [("A", 40, 30, 3)], gripper_zone=None)
 
 
 def _sheet_with_free(rects, kerf, cuts=0):

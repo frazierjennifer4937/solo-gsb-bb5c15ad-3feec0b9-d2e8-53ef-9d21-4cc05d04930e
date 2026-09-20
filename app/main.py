@@ -4,14 +4,21 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .models import PlanRequest, PlanResponse
-from .packer import CutLimitError, LockedLayoutError, UnfitItemError, build_plan
+from .packer import (
+    CutLimitError,
+    GripperZoneError,
+    LockedLayoutError,
+    UnfitItemError,
+    build_plan,
+)
 
 app = FastAPI(
     title="Guillotine Cutting Plan API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "面向小型印刷店的裁纸排版服务：给定原纸尺寸、切缝宽度和成品清单，"
-        "按可旋转的铡刀式（每刀贯穿当前子矩形）规则生成多张原纸的排版方案。"
+        "按可旋转的铡刀式（每刀贯穿当前子矩形）规则生成多张原纸的排版方案；"
+        "可选叼口保留区（gripper_zone）沿指定边整条留白。"
     ),
 )
 
@@ -75,6 +82,10 @@ def create_plan(request: PlanRequest) -> dict:
         locked.append((item_id, placement.x, placement.y,
                        placement.rotated, ref))
 
+    gripper_zone = None
+    if request.gripper_zone is not None:
+        gripper_zone = (request.gripper_zone.edge, request.gripper_zone.size)
+
     try:
         return build_plan(
             stock_width=request.stock.width,
@@ -83,6 +94,8 @@ def create_plan(request: PlanRequest) -> dict:
             items=items,
             locked=locked,
             max_cuts_per_sheet=request.max_cuts_per_sheet,
+            gripper_zone=gripper_zone,
         )
-    except (UnfitItemError, LockedLayoutError, CutLimitError) as exc:
+    except (UnfitItemError, LockedLayoutError, CutLimitError,
+            GripperZoneError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
